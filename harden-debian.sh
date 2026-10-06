@@ -9,25 +9,33 @@
 #    - les paquets déjà installés ne sont pas réinstallés ;
 #    - --dry-run montre tout ce qui serait fait, sans rien modifier.
 #
+#  Mode guidé : soit tout est fourni (options / environnement) et le script
+#  s'exécute directement, soit il manque une valeur et, si un terminal est
+#  disponible, le script la demande (défaut entre crochets, Entrée l'accepte),
+#  puis affiche un récapitulatif avant d'appliquer. Sans terminal : auto-
+#  détection quand elle existe, arrêt sinon. --yes : aucune question.
+#
 #  Exemples :
+#    sudo bash harden-debian.sh                      # mode guidé
 #    sudo bash harden-debian.sh --user admin --port 50050 \
 #         --ca-pubkey "$(cat ca.pub)"
 #    sudo bash harden-debian.sh --dry-run --user admin --port 50050
 #    sudo ADMIN_USER=admin SSH_PORT=50050 bash harden-debian.sh
-#    sudo bash harden-debian.sh --user admin            # port & CA auto-détectés
+#    sudo bash harden-debian.sh --user admin --yes   # port & CA auto-détectés
 #
 #  Options :
-#    --user <nom>            compte administrateur (obligatoire)
+#    --user <nom>            compte administrateur (demandé s'il manque)
 #    --port <n>              port SSH (défaut : port actuel de sshd)
 #    --ca-pubkey <clé>       clé publique de la CA SSH (défaut : CA déjà en place)
 #    --pubkey <clé>          clé publique classique dans authorized_keys
 #    --allow-user <nom>      compte supplémentaire à autoriser (répétable)
 #    --allow-group <grp>     autoriser un groupe entier au lieu de AllowUsers
 #    --no-create-user        ne jamais créer l'utilisateur (il doit exister)
-#    --force-create-user     le créer même si absent du mode auto
+#    --create-user, --force-create-user  le créer s'il est absent, sans question
 #    --keep-22 / --no-keep-22  garder le port 22 ouvert pendant la transition
 #    --discord-webhook <url> alerte fail2ban Discord (vide = désactivé)
 #    --sudo-nopasswd         sudo sans mot de passe pour l'admin
+#    --yes, -y               aucune question : défauts acceptés, pas de confirmation
 #    --dry-run, -n           simulation : rien n'est écrit ni redémarré
 #    --help, -h
 #
@@ -37,6 +45,11 @@ set -euo pipefail
 
 # ------------------------------- CONFIGURATION -------------------------------
 # Valeurs de départ, surchargeables par variable d'environnement puis par option.
+# Ce qui est fourni explicitement n'est jamais redemandé par le mode guidé.
+GIVEN_SUDO="${SUDO_NOPASSWD+1}"
+GIVEN_WEBHOOK="${DISCORD_WEBHOOK_URL+1}"
+GIVEN_KEEP22="${KEEP_PORT_22_TEMP+1}"
+
 ADMIN_USER="${ADMIN_USER:-}"                 # ex: admin
 SSH_PORT="${SSH_PORT:-}"                     # vide = port actuel de sshd
 USER_PUBKEY="${USER_PUBKEY:-}"               # clé publique de secours (optionnelle)
@@ -53,6 +66,7 @@ F2B_FINDTIME="10m"
 F2B_BANTIME="1h"
 
 DRY_RUN=false
+ASSUME_YES=false
 # -----------------------------------------------------------------------------
 
 TAG="# Généré par harden-debian.sh"
@@ -92,6 +106,133 @@ backup_foreign() {
 
 usage() { awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$0"; }
 
+WEBHOOK_RE='^https://(discord|discordapp)\.com/api/webhooks/'
+KEY_RE='^(ssh-rsa|ssh-ed25519|ecdsa-sha2-[a-z0-9]+|sk-ssh-[a-z0-9@.-]+|sk-ecdsa-sha2-[a-z0-9@.-]+)[[:space:]]+[A-Za-z0-9+/]+={0,3}([[:space:]].*)?$'
+
+valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 )); }
+
+# Port réellement utilisé par sshd (puis lecture directe des fichiers de
+# configuration si sshd -T n'est pas utilisable). Vide si introuvable.
+detect_port() {
+  local p
+  p="$(sshd -T 2>/dev/null | awk '/^port /{print $2; exit}')" || true
+  if [[ -z "$p" ]]; then
+    p="$(grep -rhiE '^[[:space:]]*Port[[:space:]]+[0-9]+' \
+      /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf 2>/dev/null \
+      | awk '{print $2; exit}')" || true
+  fi
+  echo "$p"
+}
+
+# Compte administrateur probable : $SUDO_USER, sinon l'unique compte humain.
+guess_admin_user() {
+  if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
+    echo "$SUDO_USER"; return 0
+  fi
+  local humans
+  humans="$(awk -F: '$3 >= 1000 && $3 < 65534 && $7 !~ /(nologin|false)$/ {print $1}' /etc/passwd)" || true
+  if [[ -n "$humans" && "$(wc -l <<<"$humans")" -eq 1 ]]; then echo "$humans"; fi
+}
+
+# ------------------------------ MODE GUIDÉ -----------------------------------
+# Les questions partent sur stderr (read -p), les réponses viennent du terminal.
+ASKED=false
+
+# ask <question> <variable> [secret] : lit une ligne, sans espaces aux bords.
+ask() {
+  local __v
+  ASKED=true
+  if [[ "${3:-}" == "secret" ]]; then
+    IFS= read -rs -p "$1" __v || { echo >&2; die "Saisie interrompue."; }
+    echo >&2
+  else
+    IFS= read -r -p "$1" __v || { echo >&2; die "Saisie interrompue."; }
+  fi
+  __v="${__v#"${__v%%[![:space:]]*}"}"
+  __v="${__v%"${__v##*[![:space:]]}"}"
+  printf -v "$2" '%s' "$__v"
+}
+
+# ask_yn <question> <o|n> : succès si oui ; le défaut est en majuscule.
+ask_yn() {
+  local r hint="[o/N]"
+  if [[ "$2" == "o" ]]; then hint="[O/n]"; fi
+  while :; do
+    ask "$1 $hint " r
+    r="${r,,}"
+    case "${r:-$2}" in
+      o|oui|y|yes) return 0 ;;
+      n|non|no)    return 1 ;;
+      *)           warn "Réponds o ou n." ;;
+    esac
+  done
+}
+
+# valid_keys <texte> <multi> : une clé publique par ligne, plusieurs si multi=true.
+valid_keys() {
+  local l n=0
+  while IFS= read -r l; do
+    if [[ -z "${l//[[:space:]]/}" ]]; then continue; fi
+    [[ "$l" =~ $KEY_RE ]] || return 1
+    if command -v ssh-keygen &>/dev/null; then
+      ssh-keygen -lf - <<<"$l" &>/dev/null || return 1
+    fi
+    n=$((n+1))
+  done <<<"$1"
+  (( n == 1 )) || { [[ "$2" == "true" ]] && (( n > 1 )); }
+}
+
+# Résumé lisible d'une ou plusieurs clés (empreinte, commentaire, type).
+key_summary() {
+  local l
+  while IFS= read -r l; do
+    if [[ -z "${l//[[:space:]]/}" ]]; then continue; fi
+    ssh-keygen -lf - <<<"$l" 2>/dev/null || awk '{print $1, $3}' <<<"$l"
+  done <<<"$1"
+}
+
+# read_pubkey <libellé> <Entrée conserve l'existant : true|false> <multi>
+# Accepte un collage (y compris coupé sur plusieurs lignes) ou le chemin d'un
+# fichier .pub. Résultat dans REPLY_KEY (vide = conserver l'existant).
+read_pubkey() {
+  local label="$1" keep="$2" multi="$3" line text path more hint="" from_file
+  if [[ "$keep" == "true" ]]; then hint=" [Entrée = conserver l'existant]"; fi
+  while :; do
+    ask "Collez la clé publique $label (ssh-ed25519 AAAA…), ou le chemin d'un fichier .pub$hint : " line
+    if [[ -z "$line" ]]; then
+      if [[ "$keep" == "true" ]]; then REPLY_KEY=""; return 0; fi
+      warn "Clé obligatoire."; continue
+    fi
+    path="${line/#\~/$HOME}"
+    from_file=false
+    if [[ ! "$line" =~ ^(ssh-|ecdsa-|sk-) && -f "$path" ]]; then
+      text="$(grep -vE '^[[:space:]]*(#|$)' "$path")" || text=""
+      from_file=true
+    else
+      text="$line"
+      # Collage coupé par le terminal : tant que la clé est incomplète (type
+      # reconnu, base64 sans commentaire), on recolle les lignes suivantes.
+      # Une ligne vide arrête la saisie.
+      while ! valid_keys "$text" "$multi" \
+            && [[ "$text" =~ ^(ssh-|ecdsa-|sk-)[^[:space:]]+[[:space:]]+[A-Za-z0-9+/]*$ ]]; do
+        IFS= read -r -p "> " more || break
+        more="${more#"${more%%[![:space:]]*}"}"
+        more="${more%"${more##*[![:space:]]}"}"
+        if [[ -z "$more" ]]; then break; fi
+        text+="$more"
+      done
+    fi
+    if valid_keys "$text" "$multi"; then REPLY_KEY="$text"; return 0; fi
+    if valid_keys "$text" true; then
+      warn "Une seule clé attendue ici."
+    elif $from_file; then
+      warn "$path ne contient pas de clé publique valide (fichier .pub attendu, pas la clé privée)."
+    else
+      warn "Clé invalide (attendu : ssh-ed25519|ssh-rsa|ecdsa-sha2-*|sk-ssh-* suivi du base64)."
+    fi
+  done
+}
+
 # ----------------------------- OPTIONS CLI -----------------------------------
 while (( $# )); do
   case "$1" in
@@ -101,12 +242,13 @@ while (( $# )); do
     --pubkey)          USER_PUBKEY="${2:?}"; shift 2 ;;
     --allow-user)      ALLOW_EXTRA_USERS="$ALLOW_EXTRA_USERS ${2:?}"; shift 2 ;;
     --allow-group)     ALLOW_GROUP="${2:?}"; shift 2 ;;
-    --discord-webhook) DISCORD_WEBHOOK_URL="${2:?}"; shift 2 ;;
+    --discord-webhook) DISCORD_WEBHOOK_URL="${2:?}"; GIVEN_WEBHOOK=1; shift 2 ;;
     --no-create-user)  CREATE_USER="never"; shift ;;
-    --force-create-user) CREATE_USER="always"; shift ;;
-    --keep-22)         KEEP_PORT_22_TEMP="true"; shift ;;
-    --no-keep-22)      KEEP_PORT_22_TEMP="false"; shift ;;
-    --sudo-nopasswd)   SUDO_NOPASSWD="true"; shift ;;
+    --create-user|--force-create-user) CREATE_USER="always"; shift ;;
+    --keep-22)         KEEP_PORT_22_TEMP="true"; GIVEN_KEEP22=1; shift ;;
+    --no-keep-22)      KEEP_PORT_22_TEMP="false"; GIVEN_KEEP22=1; shift ;;
+    --sudo-nopasswd)   SUDO_NOPASSWD="true"; GIVEN_SUDO=1; shift ;;
+    --yes|-y)          ASSUME_YES=true; shift ;;
     --dry-run|-n)      DRY_RUN=true; shift ;;
     --help|-h)         usage; exit 0 ;;
     *)                 die "Option inconnue : $1 (--help)" ;;
@@ -116,35 +258,176 @@ done
 # ------------------------------ VÉRIFICATIONS --------------------------------
 [[ $EUID -eq 0 ]] || die "Lance ce script en root (sudo)."
 grep -qi '^ID=debian' /etc/os-release || die "Script prévu pour Debian uniquement."
+
+# Questions seulement avec un terminal et sans --yes ; sinon comportement
+# non interactif : auto-détection quand elle existe, arrêt net sinon.
+INTERACTIVE=false
+if ! $ASSUME_YES && [[ -t 0 ]]; then INTERACTIVE=true; fi
+
+# 1. Compte administrateur
+if [[ -z "$ADMIN_USER" ]]; then
+  guess="$(guess_admin_user)"
+  if $INTERACTIVE; then
+    while :; do
+      ask "Compte administrateur${guess:+ [$guess]} : " ADMIN_USER
+      ADMIN_USER="${ADMIN_USER:-$guess}"
+      if [[ "$ADMIN_USER" =~ ^[a-z_][a-z0-9_-]*$ ]]; then break; fi
+      warn "Nom requis : minuscules, chiffres, _ et - (ne commence pas par un chiffre)."
+    done
+  elif $ASSUME_YES && [[ -n "$guess" ]]; then
+    ADMIN_USER="$guess"
+    log "Compte administrateur déduit : $ADMIN_USER"
+  fi
+fi
 [[ -n "$ADMIN_USER" ]] || die "Renseigne le compte administrateur : --user <nom>."
 [[ "$ADMIN_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] || die "Nom d'utilisateur invalide : $ADMIN_USER"
 [[ "$CREATE_USER" =~ ^(auto|always|never)$ ]] || die "CREATE_USER invalide (auto|always|never)."
 
-# Port : celui fourni, sinon celui réellement utilisé par sshd (puis lecture
-# directe des fichiers de configuration si sshd -T n'est pas utilisable).
-if [[ -z "$SSH_PORT" ]]; then
-  SSH_PORT="$(sshd -T 2>/dev/null | awk '/^port /{print $2; exit}')" || true
-  if [[ -z "$SSH_PORT" ]]; then
-    SSH_PORT="$(grep -rhiE '^[[:space:]]*Port[[:space:]]+[0-9]+' \
-      /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf 2>/dev/null \
-      | awk '{print $2; exit}')" || true
+# 2. Création du compte (--create-user / --no-create-user restent prioritaires)
+if $INTERACTIVE && [[ "$CREATE_USER" == "auto" ]] && ! id "$ADMIN_USER" &>/dev/null; then
+  if ask_yn "Le compte $ADMIN_USER n'existe pas. Le créer (adduser --disabled-password) ?" n; then
+    CREATE_USER="always"
+  else
+    die "L'utilisateur $ADMIN_USER est absent et sa création a été refusée."
   fi
-  [[ -n "$SSH_PORT" ]] || die "SSH_PORT vide et impossible à détecter : passe --port <n>."
-  log "Port SSH détecté : $SSH_PORT"
 fi
-[[ "$SSH_PORT" =~ ^[0-9]+$ ]] && (( SSH_PORT >= 1 && SSH_PORT <= 65535 )) \
-  || die "SSH_PORT invalide."
 
-# CA : si aucune n'est fournie, réutiliser celle déjà déployée sur la machine.
-if [[ -z "$CA_PUBKEY" && -s /etc/ssh/trusted_user_ca_keys.pub ]]; then
-  CA_PUBKEY="$(cat /etc/ssh/trusted_user_ca_keys.pub)"
+# 3. Port : celui fourni, sinon celui actuellement utilisé par sshd.
+if [[ -z "$SSH_PORT" ]]; then
+  detected_port="$(detect_port)"
+  if $INTERACTIVE; then
+    while :; do
+      ask "Port SSH${detected_port:+ [$detected_port]} : " SSH_PORT
+      SSH_PORT="${SSH_PORT:-$detected_port}"
+      if valid_port "$SSH_PORT"; then break; fi
+      warn "Port invalide (1-65535)."
+    done
+  else
+    SSH_PORT="$detected_port"
+    [[ -n "$SSH_PORT" ]] || die "SSH_PORT vide et impossible à détecter : passe --port <n>."
+    log "Port SSH détecté : $SSH_PORT"
+  fi
+fi
+valid_port "$SSH_PORT" || die "SSH_PORT invalide."
+
+# 4. Accès SSH : clés fournies, sinon CA déjà déployée sur la machine.
+CA_FOUND=""
+if [[ -s /etc/ssh/trusted_user_ca_keys.pub ]]; then
+  CA_FOUND="$(cat /etc/ssh/trusted_user_ca_keys.pub)"
+fi
+admin_home="$(getent passwd "$ADMIN_USER" | cut -d: -f6)" || admin_home=""
+AK_EXISTING=false
+if [[ -n "$admin_home" && -s "$admin_home/.ssh/authorized_keys" ]]; then AK_EXISTING=true; fi
+KEEP_AK=false        # mode guidé : on garde les clés déjà dans authorized_keys
+CA_DROPPED=false     # mode guidé : CA en place mais méthode « clé utilisateur » seule
+
+if $INTERACTIVE && [[ -z "$USER_PUBKEY" && -z "$CA_PUBKEY" ]]; then
+  if [[ -n "$CA_FOUND" ]] && $AK_EXISTING; then access_def=3
+  elif [[ -n "$CA_FOUND" ]]; then access_def=2
+  elif $AK_EXISTING; then access_def=1
+  else access_def=3
+  fi
+  echo "Accès SSH :  1) clé publique utilisateur  2) clé de CA (ca.pub)  3) les deux" >&2
+  while :; do
+    ask "Méthode [$access_def] : " access
+    access="${access:-$access_def}"
+    if [[ "$access" =~ ^[123]$ ]]; then break; fi
+    warn "Choisis 1, 2 ou 3."
+  done
+  if [[ "$access" != 2 ]]; then
+    read_pubkey "de l'utilisateur" "$AK_EXISTING" false
+    USER_PUBKEY="$REPLY_KEY"
+    if [[ -z "$USER_PUBKEY" ]]; then KEEP_AK=true; fi
+  fi
+  if [[ "$access" != 1 ]]; then
+    ca_keep=false
+    if [[ -n "$CA_FOUND" ]]; then ca_keep=true; fi
+    read_pubkey "de la CA" "$ca_keep" true
+    CA_PUBKEY="${REPLY_KEY:-$CA_FOUND}"
+  elif [[ -n "$CA_FOUND" ]]; then
+    CA_DROPPED=true
+    warn "La CA déjà en place ne sera plus acceptée (TrustedUserCAKeys retiré)."
+  fi
+elif [[ -z "$CA_PUBKEY" && -n "$CA_FOUND" ]]; then
+  CA_PUBKEY="$CA_FOUND"
   log "CA SSH déjà présente, réutilisée."
 fi
-[[ -n "$USER_PUBKEY" || -n "$CA_PUBKEY" ]] \
+[[ -n "$USER_PUBKEY" || -n "$CA_PUBKEY" ]] || $KEEP_AK \
   || die "Fournis --ca-pubkey ou --pubkey (sinon tu seras bloqué dehors)."
 
-if [[ -n "$DISCORD_WEBHOOK_URL" && ! "$DISCORD_WEBHOOK_URL" =~ ^https://(discord|discordapp)\.com/api/webhooks/ ]]; then
+# 5. sudo sans mot de passe
+if $INTERACTIVE && [[ -z "$GIVEN_SUDO" ]]; then
+  if ask_yn "sudo sans mot de passe pour $ADMIN_USER ?" n; then
+    SUDO_NOPASSWD="true"
+  else
+    SUDO_NOPASSWD="false"
+  fi
+fi
+
+# 6. Webhook Discord : saisie masquée, jamais réaffichée.
+if $INTERACTIVE && [[ -z "$GIVEN_WEBHOOK" ]]; then
+  while :; do
+    ask "URL du webhook Discord (vide = pas d'alerte, saisie masquée) : " DISCORD_WEBHOOK_URL secret
+    if [[ -z "$DISCORD_WEBHOOK_URL" || "$DISCORD_WEBHOOK_URL" =~ $WEBHOOK_RE ]]; then break; fi
+    warn "Ce n'est pas une URL de webhook Discord (https://discord.com/api/webhooks/…)."
+  done
+fi
+if [[ -n "$DISCORD_WEBHOOK_URL" && ! "$DISCORD_WEBHOOK_URL" =~ $WEBHOOK_RE ]]; then
   die "DISCORD_WEBHOOK_URL ne ressemble pas à une URL de webhook Discord."
+fi
+
+# 7. Port 22 pendant la transition
+if $INTERACTIVE && [[ -z "$GIVEN_KEEP22" && "$SSH_PORT" != "22" ]]; then
+  if ask_yn "Garder le port 22 ouvert pendant la transition ?" o; then
+    KEEP_PORT_22_TEMP="true"
+  else
+    KEEP_PORT_22_TEMP="false"
+  fi
+fi
+
+# Récapitulatif et confirmation, seulement si une question a été posée.
+if $ASKED; then
+  if id "$ADMIN_USER" &>/dev/null; then acct="existant"
+  elif [[ "$CREATE_USER" == "never" ]]; then acct="absent, création désactivée"
+  else acct="à créer, adduser --disabled-password"
+  fi
+  # Alignement en caractères (printf compte les octets, pas les accents).
+  recap() { printf '      %s%*s %s\n' "$1" $((20 - ${#1})) '' "$2"; }
+  methods=()
+  if [[ -n "$USER_PUBKEY" ]] || $KEEP_AK; then methods+=("clé utilisateur"); fi
+  if [[ -n "$CA_PUBKEY" ]]; then methods+=("CA"); fi
+  echo
+  log "Récapitulatif :"
+  recap "Compte" "$ADMIN_USER — $acct"
+  recap "Port SSH" "$SSH_PORT"
+  recap "Accès SSH" "$(IFS=,; echo "${methods[*]}" | sed 's/,/ + /g')"
+  if [[ -n "$USER_PUBKEY" ]]; then
+    recap "Clé utilisateur" "$(key_summary "$USER_PUBKEY")"
+  elif $KEEP_AK; then
+    recap "Clé utilisateur" "clés existantes d'authorized_keys conservées"
+  fi
+  if [[ -n "$CA_PUBKEY" ]]; then
+    while IFS= read -r l; do
+      recap "Clé de CA" "$l"
+    done < <(key_summary "$CA_PUBKEY")
+  elif $CA_DROPPED; then
+    recap "Clé de CA" "CA en place désactivée"
+  fi
+  if [[ "$SUDO_NOPASSWD" == "true" ]]; then sudo_txt="sans mot de passe"; else sudo_txt="avec mot de passe"; fi
+  recap "sudo" "$sudo_txt"
+  if [[ -n "$DISCORD_WEBHOOK_URL" ]]; then discord_txt="activée"; else discord_txt="désactivée"; fi
+  recap "Alerte Discord" "$discord_txt"
+  if [[ "$SSH_PORT" == "22" ]]; then p22_txt="c'est le port SSH"
+  elif [[ "$KEEP_PORT_22_TEMP" == "true" ]]; then p22_txt="gardé ouvert pendant la transition"
+  else p22_txt="fermé"
+  fi
+  recap "Port 22" "$p22_txt"
+  if $DRY_RUN; then recap "Mode" "simulation (--dry-run)"; fi
+  echo
+  if ! $ASSUME_YES && ! ask_yn "Appliquer ?" o; then
+    warn "Abandon : rien n'a été modifié."
+    exit 0
+  fi
 fi
 
 # Comptes déjà présents qui perdront l'accès SSH si on ne les autorise pas.
@@ -188,7 +471,11 @@ if id "$ADMIN_USER" &>/dev/null; then
   log "Utilisateur $ADMIN_USER déjà existant : création ignorée."
 elif (( want_create )); then
   log "Création de l'utilisateur $ADMIN_USER..."
-  run adduser --disabled-password --gecos "" "$ADMIN_USER"
+  if $DRY_RUN; then
+    printf '    [dry-run] adduser --disabled-password --gecos '\'''\'' %s\n' "$ADMIN_USER"
+  else
+    adduser --disabled-password --gecos "" "$ADMIN_USER"
+  fi
 else
   die "L'utilisateur $ADMIN_USER est absent et la création est désactivée (--no-create-user)."
 fi
