@@ -2,100 +2,279 @@
 # =============================================================================
 #  harden-debian.sh — Durcissement de base d'un serveur Debian (VPS ou local)
 #
-#  - Création d'un utilisateur sudo
-#  - SSH : port personnalisé, root interdit, clés uniquement, TrustedUserCAKeys
-#  - UFW : deny incoming par défaut, allow SSH uniquement
-#  - Fail2ban : jail sshd (backend systemd) + ban progressif + alerte Telegram
-#  - Bonus : unattended-upgrades, durcissement sysctl
+#  Réutilisable : machine vierge (VPS) comme machine déjà en service.
+#  Rien n'est recréé ni écrasé en aveugle :
+#    - un utilisateur qui existe déjà n'est jamais recréé (mode auto) ;
+#    - tout fichier de config absent de ce script est sauvegardé avant écrasement ;
+#    - les paquets déjà installés ne sont pas réinstallés ;
+#    - --dry-run montre tout ce qui serait fait, sans rien modifier.
 #
-#  Usage : éditer les variables ci-dessous, puis  sudo bash harden-debian.sh
-#  Script idempotent : il peut être relancé sans casse.
+#  Exemples :
+#    sudo bash harden-debian.sh --user admin --port 50050 \
+#         --ca-pubkey "$(cat ca.pub)"
+#    sudo bash harden-debian.sh --dry-run --user admin --port 50050
+#    sudo ADMIN_USER=admin SSH_PORT=50050 bash harden-debian.sh
+#    sudo bash harden-debian.sh --user admin            # port & CA auto-détectés
+#
+#  Options :
+#    --user <nom>            compte administrateur (obligatoire)
+#    --port <n>              port SSH (défaut : port actuel de sshd)
+#    --ca-pubkey <clé>       clé publique de la CA SSH (défaut : CA déjà en place)
+#    --pubkey <clé>          clé publique classique dans authorized_keys
+#    --allow-user <nom>      compte supplémentaire à autoriser (répétable)
+#    --allow-group <grp>     autoriser un groupe entier au lieu de AllowUsers
+#    --no-create-user        ne jamais créer l'utilisateur (il doit exister)
+#    --force-create-user     le créer même si absent du mode auto
+#    --keep-22 / --no-keep-22  garder le port 22 ouvert pendant la transition
+#    --discord-webhook <url> alerte fail2ban Discord (vide = désactivé)
+#    --sudo-nopasswd         sudo sans mot de passe pour l'admin
+#    --dry-run, -n           simulation : rien n'est écrit ni redémarré
+#    --help, -h
+#
+#  Script idempotent : relançable sans casse.
 # =============================================================================
 set -euo pipefail
 
 # ------------------------------- CONFIGURATION -------------------------------
-NEW_USER=""                 # utilisateur à créer
-SSH_PORT=""                  # nouveau port SSH (1024-65535 conseillé)
+# Valeurs de départ, surchargeables par variable d'environnement puis par option.
+ADMIN_USER="${ADMIN_USER:-}"                 # ex: admin
+SSH_PORT="${SSH_PORT:-}"                     # vide = port actuel de sshd
+USER_PUBKEY="${USER_PUBKEY:-}"               # clé publique de secours (optionnelle)
+CA_PUBKEY="${CA_PUBKEY:-}"                   # clé publique de la CA (optionnelle)
+SUDO_NOPASSWD="${SUDO_NOPASSWD:-false}"
+DISCORD_WEBHOOK_URL="${DISCORD_WEBHOOK_URL:-}"
+KEEP_PORT_22_TEMP="${KEEP_PORT_22_TEMP:-true}"
+CREATE_USER="${CREATE_USER:-auto}"           # auto | always | never
+ALLOW_EXTRA_USERS="${ALLOW_EXTRA_USERS:-}"   # noms séparés par des espaces
+ALLOW_GROUP="${ALLOW_GROUP:-}"               # ex: sudo (alternative à AllowUsers)
 
-# Au moins UNE des deux méthodes d'authentification ci-dessous est obligatoire.
-# Clé publique classique (secours ou usage sans CA) — laisser vide si inutile
-USER_PUBKEY=""
-# Clé publique de ta CA SSH (contenu de ca.pub) — laisser vide si pas de CA
-CA_PUBKEY=""
-
-SUDO_NOPASSWD="false"            # "true" = sudo sans mot de passe
-
-# Discord (laisser vide pour désactiver l'alerte)
-DISCORD_WEBHOOK_URL=""           # ex: https://discord.com/api/webhooks/123/abc...
-
-# Garder le port 22 ouvert temporairement pendant la transition (recommandé)
-KEEP_PORT_22_TEMP="true"
-
-# Paramètres fail2ban
 F2B_MAXRETRY="5"
 F2B_FINDTIME="10m"
 F2B_BANTIME="1h"
+
+DRY_RUN=false
 # -----------------------------------------------------------------------------
+
+TAG="# Généré par harden-debian.sh"
+BACKUPS=()
 
 log()  { echo -e "\e[1;32m[+]\e[0m $*"; }
 warn() { echo -e "\e[1;33m[!]\e[0m $*"; }
 die()  { echo -e "\e[1;31m[x]\e[0m $*" >&2; exit 1; }
 
+# Exécute une commande, ou l'affiche seulement en simulation.
+run() {
+  if $DRY_RUN; then printf '    [dry-run] %s\n' "$*"; else "$@"; fi
+}
+
+# Écrit un fichier depuis stdin ; en simulation, affiche son contenu.
+put() {
+  local p="$1"
+  if $DRY_RUN; then
+    printf '    [dry-run] écrirait %s :\n' "$p"
+    sed 's/^/        | /'
+  else
+    mkdir -p "$(dirname "$p")"
+    cat > "$p"
+  fi
+}
+
+# Sauvegarde un fichier existant qui n'est pas géré par ce script.
+backup_foreign() {
+  local p="$1"
+  [[ -e "$p" ]] || return 0
+  grep -qF "$TAG" "$p" 2>/dev/null && return 0
+  local b="$p.bak.$(date +%Y%m%d-%H%M%S)"
+  warn "Fichier existant géré hors de ce script, sauvegarde : $b"
+  run cp -a "$p" "$b"
+  BACKUPS+=("$b")
+}
+
+usage() { awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$0"; }
+
+# ----------------------------- OPTIONS CLI -----------------------------------
+while (( $# )); do
+  case "$1" in
+    --user)            ADMIN_USER="${2:?}"; shift 2 ;;
+    --port)            SSH_PORT="${2:?}"; shift 2 ;;
+    --ca-pubkey)       CA_PUBKEY="${2:?}"; shift 2 ;;
+    --pubkey)          USER_PUBKEY="${2:?}"; shift 2 ;;
+    --allow-user)      ALLOW_EXTRA_USERS="$ALLOW_EXTRA_USERS ${2:?}"; shift 2 ;;
+    --allow-group)     ALLOW_GROUP="${2:?}"; shift 2 ;;
+    --discord-webhook) DISCORD_WEBHOOK_URL="${2:?}"; shift 2 ;;
+    --no-create-user)  CREATE_USER="never"; shift ;;
+    --force-create-user) CREATE_USER="always"; shift ;;
+    --keep-22)         KEEP_PORT_22_TEMP="true"; shift ;;
+    --no-keep-22)      KEEP_PORT_22_TEMP="false"; shift ;;
+    --sudo-nopasswd)   SUDO_NOPASSWD="true"; shift ;;
+    --dry-run|-n)      DRY_RUN=true; shift ;;
+    --help|-h)         usage; exit 0 ;;
+    *)                 die "Option inconnue : $1 (--help)" ;;
+  esac
+done
+
 # ------------------------------ VÉRIFICATIONS --------------------------------
 [[ $EUID -eq 0 ]] || die "Lance ce script en root (sudo)."
 grep -qi '^ID=debian' /etc/os-release || die "Script prévu pour Debian uniquement."
-[[ -n "$USER_PUBKEY" || -n "$CA_PUBKEY" ]] \
-  || die "Renseigne USER_PUBKEY et/ou CA_PUBKEY, sinon tu seras bloqué dehors."
+[[ -n "$ADMIN_USER" ]] || die "Renseigne le compte administrateur : --user <nom>."
+[[ "$ADMIN_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] || die "Nom d'utilisateur invalide : $ADMIN_USER"
+[[ "$CREATE_USER" =~ ^(auto|always|never)$ ]] || die "CREATE_USER invalide (auto|always|never)."
+
+# Port : celui fourni, sinon celui réellement utilisé par sshd (puis lecture
+# directe des fichiers de configuration si sshd -T n'est pas utilisable).
+if [[ -z "$SSH_PORT" ]]; then
+  SSH_PORT="$(sshd -T 2>/dev/null | awk '/^port /{print $2; exit}')" || true
+  if [[ -z "$SSH_PORT" ]]; then
+    SSH_PORT="$(grep -rhiE '^[[:space:]]*Port[[:space:]]+[0-9]+' \
+      /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf 2>/dev/null \
+      | awk '{print $2; exit}')" || true
+  fi
+  [[ -n "$SSH_PORT" ]] || die "SSH_PORT vide et impossible à détecter : passe --port <n>."
+  log "Port SSH détecté : $SSH_PORT"
+fi
 [[ "$SSH_PORT" =~ ^[0-9]+$ ]] && (( SSH_PORT >= 1 && SSH_PORT <= 65535 )) \
   || die "SSH_PORT invalide."
+
+# CA : si aucune n'est fournie, réutiliser celle déjà déployée sur la machine.
+if [[ -z "$CA_PUBKEY" && -s /etc/ssh/trusted_user_ca_keys.pub ]]; then
+  CA_PUBKEY="$(cat /etc/ssh/trusted_user_ca_keys.pub)"
+  log "CA SSH déjà présente, réutilisée."
+fi
+[[ -n "$USER_PUBKEY" || -n "$CA_PUBKEY" ]] \
+  || die "Fournis --ca-pubkey ou --pubkey (sinon tu seras bloqué dehors)."
+
 if [[ -n "$DISCORD_WEBHOOK_URL" && ! "$DISCORD_WEBHOOK_URL" =~ ^https://(discord|discordapp)\.com/api/webhooks/ ]]; then
   die "DISCORD_WEBHOOK_URL ne ressemble pas à une URL de webhook Discord."
 fi
 
+# Comptes déjà présents qui perdront l'accès SSH si on ne les autorise pas.
+if [[ -z "$ALLOW_GROUP" ]]; then
+  others="$(awk -F: -v me="$ADMIN_USER" -v extra=" $ALLOW_EXTRA_USERS " \
+    '$3 >= 1000 && $3 < 65534 && $7 !~ /(nologin|false)$/ && $1 != me && index(extra, " " $1 " ") == 0 {print $1}' \
+    /etc/passwd | paste -sd' ' -)" || true
+  if [[ -n "$others" ]]; then
+    warn "Ces comptes ne seront PAS autorisés (AllowUsers) : $others"
+    warn "Ajoute-les avec --allow-user <nom> si tu en as besoin."
+  fi
+fi
+
 # ------------------------------- PAQUETS -------------------------------------
-log "Installation des paquets..."
-export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
-apt-get install -y -qq sudo ufw fail2ban python3-systemd curl \
-  unattended-upgrades apt-listchanges >/dev/null
+PKGS=(sudo ufw fail2ban python3-systemd curl unattended-upgrades apt-listchanges)
+missing=()
+for p in "${PKGS[@]}"; do
+  dpkg -s "$p" &>/dev/null || missing+=("$p")
+done
+if (( ${#missing[@]} )); then
+  log "Paquets manquants : ${missing[*]}"
+  if $DRY_RUN; then
+    printf '    [dry-run] apt-get update && apt-get install -y %s\n' "${missing[*]}"
+  else
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq
+    apt-get install -y -qq "${missing[@]}" >/dev/null
+  fi
+else
+  log "Tous les paquets requis sont déjà installés."
+fi
 
 # ---------------------------- UTILISATEUR ------------------------------------
-if id "$NEW_USER" &>/dev/null; then
-  log "Utilisateur $NEW_USER déjà existant."
+case "$CREATE_USER" in
+  always) want_create=1 ;;
+  never)  want_create=0 ;;
+  auto)   if id "$ADMIN_USER" &>/dev/null; then want_create=0; else want_create=1; fi ;;
+esac
+
+if id "$ADMIN_USER" &>/dev/null; then
+  log "Utilisateur $ADMIN_USER déjà existant : création ignorée."
+elif (( want_create )); then
+  log "Création de l'utilisateur $ADMIN_USER..."
+  run adduser --disabled-password --gecos "" "$ADMIN_USER"
 else
-  log "Création de l'utilisateur $NEW_USER..."
-  adduser --disabled-password --gecos "" "$NEW_USER" >/dev/null
+  die "L'utilisateur $ADMIN_USER est absent et la création est désactivée (--no-create-user)."
 fi
-usermod -aG sudo "$NEW_USER"
+
+if id -nG "$ADMIN_USER" 2>/dev/null | tr ' ' '\n' | grep -qx sudo; then
+  log "$ADMIN_USER est déjà dans le groupe sudo."
+else
+  log "Ajout de $ADMIN_USER au groupe sudo..."
+  run usermod -aG sudo "$ADMIN_USER"
+fi
 
 if [[ "$SUDO_NOPASSWD" == "true" ]]; then
-  echo "$NEW_USER ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/90-$NEW_USER"
-  chmod 440 "/etc/sudoers.d/90-$NEW_USER"
-  visudo -cf "/etc/sudoers.d/90-$NEW_USER" >/dev/null || die "Fichier sudoers invalide."
-elif passwd -S "$NEW_USER" | awk '{print $2}' | grep -qv '^P$'; then
-  warn "Définis un mot de passe pour $NEW_USER (utilisé uniquement par sudo) :"
-  passwd "$NEW_USER"
+  log "sudo sans mot de passe pour $ADMIN_USER."
+  put "/etc/sudoers.d/90-$ADMIN_USER" <<EOF
+$TAG
+$ADMIN_USER ALL=(ALL) NOPASSWD:ALL
+EOF
+  run chmod 440 "/etc/sudoers.d/90-$ADMIN_USER"
+  if ! $DRY_RUN; then
+    visudo -cf "/etc/sudoers.d/90-$ADMIN_USER" >/dev/null || die "Fichier sudoers invalide."
+  fi
+else
+  # État du mot de passe : P = défini, L/NP = verrouillé ou absent.
+  state="$(passwd -S "$ADMIN_USER" 2>/dev/null | awk '{print $2}')" || state="?"
+  case "$state" in
+    P)  : ;;
+    L|NP|"")
+        warn "Aucun mot de passe utilisable pour $ADMIN_USER (état : ${state:-inconnu})."
+        warn "Il servira uniquement à sudo, pas à SSH."
+        if $DRY_RUN; then
+          printf '    [dry-run] passwd %s\n' "$ADMIN_USER"
+        else
+          passwd "$ADMIN_USER"
+        fi ;;
+    *)  warn "État du mot de passe inconnu ($state) : rien changé." ;;
+  esac
 fi
 
 if [[ -n "$USER_PUBKEY" ]]; then
-  log "Ajout de la clé publique..."
-  install -d -m 700 -o "$NEW_USER" -g "$NEW_USER" "/home/$NEW_USER/.ssh"
-  AK="/home/$NEW_USER/.ssh/authorized_keys"
-  touch "$AK"
-  grep -qxF "$USER_PUBKEY" "$AK" || echo "$USER_PUBKEY" >> "$AK"
-  chown "$NEW_USER:$NEW_USER" "$AK"; chmod 600 "$AK"
+  log "Ajout de la clé publique dans authorized_keys..."
+  run install -d -m 700 -o "$ADMIN_USER" -g "$ADMIN_USER" "/home/$ADMIN_USER/.ssh"
+  AK="/home/$ADMIN_USER/.ssh/authorized_keys"
+  if $DRY_RUN; then
+    printf '    [dry-run] ajouterait la clé dans %s\n' "$AK"
+  else
+    touch "$AK"
+    grep -qxF "$USER_PUBKEY" "$AK" || echo "$USER_PUBKEY" >> "$AK"
+    chown "$ADMIN_USER:$ADMIN_USER" "$AK"
+    chmod 600 "$AK"
+  fi
 fi
 
 # --------------------------------- SSH ---------------------------------------
 log "Configuration SSH..."
 if [[ -n "$CA_PUBKEY" ]]; then
-  echo "$CA_PUBKEY" > /etc/ssh/trusted_user_ca_keys.pub
-  chmod 644 /etc/ssh/trusted_user_ca_keys.pub
+  put /etc/ssh/trusted_user_ca_keys.pub <<EOF
+$CA_PUBKEY
+EOF
+  run chmod 644 /etc/ssh/trusted_user_ca_keys.pub
+fi
+
+# Liste des comptes autorisés (le compte admin, plus les --allow-user).
+allow_users=("$ADMIN_USER")
+for u in $ALLOW_EXTRA_USERS; do
+  for seen in "${allow_users[@]}"; do
+    [[ "$u" == "$seen" ]] && continue 2
+  done
+  allow_users+=("$u")
+done
+
+ADMISSION_LINE="AllowUsers ${allow_users[*]}"
+if [[ -n "$ALLOW_GROUP" ]]; then
+  ADMISSION_LINE="AllowGroups $ALLOW_GROUP"
+  warn "AllowGroups $ALLOW_GROUP : tout compte absent de ce groupe perdra SSH."
+fi
+
+CA_LINE=""
+if [[ -n "$CA_PUBKEY" ]]; then
+  CA_LINE="TrustedUserCAKeys /etc/ssh/trusted_user_ca_keys.pub"
 fi
 
 # Debian lit sshd_config.d en premier et la 1re valeur gagne → préfixe 00-
-cat > /etc/ssh/sshd_config.d/00-hardening.conf <<EOF
-# Généré par harden-debian.sh
+SSHD_CONF=/etc/ssh/sshd_config.d/00-hardening.conf
+backup_foreign "$SSHD_CONF"
+put "$SSHD_CONF" <<EOF
+$TAG
 Port $SSH_PORT
 PermitRootLogin no
 PubkeyAuthentication yes
@@ -103,48 +282,64 @@ PasswordAuthentication no
 KbdInteractiveAuthentication no
 PermitEmptyPasswords no
 AuthenticationMethods publickey
-AllowUsers $NEW_USER
+$ADMISSION_LINE
 MaxAuthTries 3
 LoginGraceTime 30
 X11Forwarding no
 ClientAliveInterval 300
 ClientAliveCountMax 2
-$( [[ -n "$CA_PUBKEY" ]] && echo "TrustedUserCAKeys /etc/ssh/trusted_user_ca_keys.pub" )
+$CA_LINE
 EOF
 
-mkdir -p /run/sshd
-sshd -t || die "Configuration sshd invalide, rien n'a été redémarré."
+if $DRY_RUN; then
+  log "[dry-run] sshd -t non exécuté (configuration non écrite)."
+else
+  mkdir -p /run/sshd
+  sshd -t || die "Configuration sshd invalide : rien n'a été redémarré."
+fi
 
 # Cas où l'activation par socket est utilisée
 if systemctl is-enabled ssh.socket &>/dev/null; then
-  mkdir -p /etc/systemd/system/ssh.socket.d
-  printf '[Socket]\nListenStream=\nListenStream=%s\n' "$SSH_PORT" \
-    > /etc/systemd/system/ssh.socket.d/override.conf
-  systemctl daemon-reload
+  log "Activation par socket détectée (ssh.socket)."
+  run mkdir -p /etc/systemd/system/ssh.socket.d
+  put /etc/systemd/system/ssh.socket.d/override.conf <<EOF
+$TAG
+[Socket]
+ListenStream=
+ListenStream=$SSH_PORT
+EOF
+  run systemctl daemon-reload
 fi
 
 # --------------------------------- UFW ---------------------------------------
 log "Configuration UFW..."
-ufw default deny incoming  >/dev/null
-ufw default allow outgoing >/dev/null
-ufw allow "$SSH_PORT/tcp" comment 'SSH' >/dev/null
+run ufw default deny incoming
+run ufw default allow outgoing
+run ufw allow "$SSH_PORT/tcp" comment 'SSH'
 if [[ "$KEEP_PORT_22_TEMP" == "true" && "$SSH_PORT" != "22" ]]; then
-  ufw allow 22/tcp comment 'SSH temporaire - a supprimer' >/dev/null
+  warn "Port 22 laissé ouvert temporairement (transition)."
+  run ufw allow 22/tcp comment 'SSH temporaire - a supprimer'
 fi
-ufw --force enable >/dev/null
+run ufw --force enable
 
 # ------------------------------- DISCORD -------------------------------------
 # Nettoyage d'une éventuelle ancienne config Telegram
-rm -f /etc/fail2ban/telegram.env /usr/local/bin/f2b-telegram.sh /etc/fail2ban/action.d/telegram.conf
+run rm -f /etc/fail2ban/telegram.env /usr/local/bin/f2b-telegram.sh /etc/fail2ban/action.d/telegram.conf
 
 DISCORD_ENABLED="false"
 if [[ -n "$DISCORD_WEBHOOK_URL" ]]; then
   DISCORD_ENABLED="true"
   log "Configuration de l'alerte Discord..."
-  install -m 600 /dev/null /etc/fail2ban/discord.env
-  echo "DISCORD_WEBHOOK_URL=\"$DISCORD_WEBHOOK_URL\"" > /etc/fail2ban/discord.env
+  if $DRY_RUN; then
+    # L'URL de webhook est un secret : jamais recopiée en clair dans la sortie.
+    printf '    [dry-run] écrirait /etc/fail2ban/discord.env :\n'
+    printf '        | DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/<id>/<masqué>"\n'
+  else
+    printf 'DISCORD_WEBHOOK_URL="%s"\n' "$DISCORD_WEBHOOK_URL" > /etc/fail2ban/discord.env
+    chmod 600 /etc/fail2ban/discord.env
+  fi
 
-  cat > /usr/local/bin/f2b-discord.sh <<'EOF'
+  put /usr/local/bin/f2b-discord.sh <<'EOF'
 #!/usr/bin/env bash
 # Usage : f2b-discord.sh <ban|unban|start|stop|test> <jail|message> [ip] [failures] [bantime]
 source /etc/fail2ban/discord.env
@@ -163,9 +358,10 @@ PAYLOAD="$(python3 -c 'import json,sys; print(json.dumps({"username":"Fail2ban",
 curl -s -m 10 -o /dev/null -H "Content-Type: application/json" \
   -X POST -d "$PAYLOAD" "$DISCORD_WEBHOOK_URL" || true
 EOF
-  chmod 700 /usr/local/bin/f2b-discord.sh
+  run chmod 700 /usr/local/bin/f2b-discord.sh
 
-  cat > /etc/fail2ban/action.d/discord.conf <<'EOF'
+  put /etc/fail2ban/action.d/discord.conf <<'EOF'
+# Généré par harden-debian.sh
 [Definition]
 actionstart =
 actionstop  =
@@ -180,7 +376,14 @@ fi
 
 # ------------------------------- FAIL2BAN ------------------------------------
 log "Configuration Fail2ban..."
-cat > /etc/fail2ban/jail.local <<EOF
+F2B_ACTION_LINE=""
+if [[ "$DISCORD_ENABLED" == "true" ]]; then
+  F2B_ACTION_LINE="action = %(action_)s
+         discord[name=%(__name__)s]"
+fi
+
+put /etc/fail2ban/jail.local <<EOF
+$TAG
 [DEFAULT]
 backend = systemd
 banaction = ufw
@@ -197,22 +400,25 @@ ignoreip = 127.0.0.1/8 ::1
 enabled = true
 port = $SSH_PORT
 mode = aggressive
-$( [[ "$DISCORD_ENABLED" == "true" ]] && printf 'action = %%(action_)s\n         discord[name=%%(__name__)s]' )
+$F2B_ACTION_LINE
 EOF
 
-systemctl enable fail2ban >/dev/null 2>&1
-systemctl restart fail2ban
+run systemctl enable fail2ban
+run systemctl restart fail2ban
 
 # ------------------------- MISES À JOUR AUTO ---------------------------------
 log "Activation des mises à jour de sécurité automatiques..."
-cat > /etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
+# APT n'accepte qu'un commentaire en « // » — pas de « # » dans ce fichier.
+put /etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
+// Généré par harden-debian.sh
 APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Unattended-Upgrade "1";
 EOF
 
 # -------------------------------- SYSCTL -------------------------------------
 log "Durcissement réseau (sysctl)..."
-cat > /etc/sysctl.d/99-hardening.conf <<'EOF'
+put /etc/sysctl.d/99-hardening.conf <<'EOF'
+# Généré par harden-debian.sh
 net.ipv4.conf.all.rp_filter = 1
 net.ipv4.conf.default.rp_filter = 1
 net.ipv4.conf.all.accept_redirects = 0
@@ -226,23 +432,37 @@ net.ipv4.icmp_echo_ignore_broadcasts = 1
 net.ipv4.tcp_syncookies = 1
 net.ipv4.conf.all.log_martians = 1
 EOF
-sysctl --system >/dev/null
+run sysctl --system
 
 # --------------------------- REDÉMARRAGE SSH ---------------------------------
 log "Redémarrage de SSH..."
 if systemctl is-enabled ssh.socket &>/dev/null; then
-  systemctl restart ssh.socket
+  run systemctl restart ssh.socket
 fi
-systemctl restart ssh
+run systemctl restart ssh
 
-[[ "$DISCORD_ENABLED" == "true" ]] && \
-  /usr/local/bin/f2b-discord.sh test "Durcissement terminé (SSH port $SSH_PORT)"
+if [[ "$DISCORD_ENABLED" == "true" ]]; then
+  run /usr/local/bin/f2b-discord.sh test "Durcissement terminé (SSH port $SSH_PORT)"
+fi
 
 # -------------------------------- RÉSUMÉ -------------------------------------
 echo
+if $DRY_RUN; then
+  warn "Simulation terminée : rien n'a été modifié. Relance sans --dry-run."
+  exit 0
+fi
+
 log "Terminé."
+echo "      Mode utilisateur : $CREATE_USER → compte $ADMIN_USER"
+echo "      Port SSH         : $SSH_PORT"
+echo "      Comptes autorisés: ${allow_users[*]}${ALLOW_GROUP:+ (via le groupe $ALLOW_GROUP)}"
+if (( ${#BACKUPS[@]} )); then
+  echo "      Sauvegardes      :"
+  printf '        %s\n' "${BACKUPS[@]}"
+fi
+echo
 warn "NE FERME PAS cette session. Dans un autre terminal, teste :"
-echo "      ssh -p $SSH_PORT $NEW_USER@<ip_du_serveur>"
+echo "      ssh -p $SSH_PORT $ADMIN_USER@<ip_du_serveur>"
 if [[ "$KEEP_PORT_22_TEMP" == "true" && "$SSH_PORT" != "22" ]]; then
   warn "Une fois la connexion validée, ferme le port 22 :"
   echo "      sudo ufw delete allow 22/tcp"
@@ -250,4 +470,4 @@ fi
 echo "  Vérifications utiles :"
 echo "      sudo ufw status verbose"
 echo "      sudo fail2ban-client status sshd"
-echo "      sudo sshd -T | grep -Ei 'port|permitroot|password|trustedusercakeys'"
+echo "      sudo sshd -T | grep -Ei 'port|permitroot|password|trustedusercakeys|allowusers'"
